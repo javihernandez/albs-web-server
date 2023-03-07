@@ -4,11 +4,16 @@ import typing
 import datetime
 
 import aioredis
-from fastapi import APIRouter, Depends, Query, WebSocket
+from fastapi import (
+    APIRouter,
+    Depends,
+    WebSocket,
+)
 
 from alws import database
+from alws.auth import get_current_user
 from alws.crud import sign_task
-from alws.dependencies import get_db, get_redis, JWTBearer
+from alws.dependencies import get_db, get_redis
 from alws import dramatiq
 from alws.schemas import sign_schema
 
@@ -16,7 +21,7 @@ from alws.schemas import sign_schema
 router = APIRouter(
     prefix='/sign-tasks',
     tags=['sign-tasks'],
-    dependencies=[Depends(JWTBearer())]
+    dependencies=[Depends(get_current_user)]
 )
 
 public_router = APIRouter(
@@ -33,8 +38,9 @@ async def get_sign_tasks(build_id: int = None,
 
 @router.post('/', response_model=sign_schema.SignTask)
 async def create_sign_task(payload: sign_schema.SignTaskCreate,
-                           db: database.Session = Depends(get_db)):
-    return await sign_task.create_sign_task(db, payload)
+                           db: database.Session = Depends(get_db),
+                           user=Depends(get_current_user)):
+    return await sign_task.create_sign_task(db, payload, user.id)
 
 
 @router.post('/get_sign_task/',
@@ -56,17 +62,18 @@ async def complete_sign_task(
         payload: sign_schema.SignTaskComplete,
         db: database.Session = Depends(get_db)):
     task = await sign_task.get_sign_task(db, sign_task_id)
-    task.ts = datetime.datetime.now() + datetime.timedelta(hours=2)
+    task.ts = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
     await db.commit()
     dramatiq.sign_task.complete_sign_task.send(sign_task_id, payload.dict())
     return {'success': True}
 
 
-@router.post('/sync_sign_task/',
-             response_model=typing.Union[
-                 sign_schema.SyncSignTaskResponse,
-                 sign_schema.SyncSignTaskError
-            ]
+@router.post(
+    '/sync_sign_task/',
+    response_model=typing.Union[
+        sign_schema.SyncSignTaskResponse,
+        sign_schema.SyncSignTaskError,
+    ],
 )
 async def create_small_sign_task(
             payload: sign_schema.SyncSignTaskRequest,
@@ -76,7 +83,8 @@ async def create_small_sign_task(
     task_payload = {
         'task_id': task_id,
         'content': payload.content,
-        'key_id': payload.pgp_keyid
+        'key_id': payload.pgp_keyid,
+        'sig_type': payload.sig_type,
     }
     pubsub = redis.pubsub()
     await pubsub.subscribe(task_id)

@@ -211,6 +211,7 @@ class MultilibProcessor:
                         name=artifact.name,
                         type=artifact.type,
                         href=href,
+                        cas_hash=artifact.cas_hash,
                     ))
                     if is_debuginfo_rpm(artifact_name):
                         debug_pkg_hrefs.append(href)
@@ -236,7 +237,7 @@ class MultilibProcessor:
     async def get_packages_info_from_pulp(self, rpm_packages: list):
         results = await asyncio.gather(
             *(get_rpm_package_info(
-                self._pulp_client, rpm.href,
+                self._pulp_client, rpm,
                 include_fields=['epoch', 'name', 'version', 'release', 'arch']
             ) for rpm in rpm_packages)
         )
@@ -248,11 +249,13 @@ class MultilibProcessor:
                                   module_stream: str, packages: list):
         if not packages:
             return
-        if module_index.has_devel_module() and 'python' not in module_name:
+
+        # Ruby and Python modules should have multilib in their main module
+        if 'ruby' in module_name or 'python' in module_name:
+            module = module_index.get_module(module_name, module_stream)
+        else:
             module = module_index.get_module(
                 f'{module_name}-devel', module_stream)
-        else:
-            module = module_index.get_module(module_name, module_stream)
 
         for pkg_info in packages:
             module.add_rpm_artifact(pkg_info, multilib=True)

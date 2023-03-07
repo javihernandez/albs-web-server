@@ -61,6 +61,7 @@ class SignRpmInfo(BaseModel):
     arch: typing.Optional[str]
     type: str
     download_url: str
+    cas_hash: typing.Optional[str]
 
 
 class SignedRpmInfo(BaseModel):
@@ -71,6 +72,7 @@ class SignedRpmInfo(BaseModel):
     href: str
     fingerprint: str
     sha256: str
+    cas_hash: typing.Optional[str]
 
 
 class AvailableSignTask(BaseModel):
@@ -86,6 +88,7 @@ class SignTaskComplete(BaseModel):
     error_message: typing.Optional[str]
     log_href: typing.Optional[str]
     packages: typing.Optional[typing.List[SignedRpmInfo]]
+    stats: typing.Optional[dict]
 
 
 class SignTaskCompleteResponse(BaseModel):
@@ -95,6 +98,7 @@ class SignTaskCompleteResponse(BaseModel):
 class SyncSignTaskRequest(BaseModel):
     content: str
     pgp_keyid: str
+    sig_type: typing.Literal['detach-sign', 'clear-sign'] = 'detach-sign'
 
 
 class SyncSignTaskResponse(BaseModel):

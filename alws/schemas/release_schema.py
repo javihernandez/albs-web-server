@@ -1,6 +1,7 @@
+import datetime
 import typing
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from alws.schemas.user_schema import User
 from alws.schemas.platform_schema import Platform
@@ -14,15 +15,27 @@ __all__ = [
 ]
 
 
+class ReleaseProduct(BaseModel):
+    id: int
+    name: str
+    title: typing.Optional[str]
+    description: typing.Optional[str]
+    is_community: bool
+
+    class Config:
+        orm_mode = True
+
+
 class Release(BaseModel):
     id: int
     status: int
     build_ids: typing.List[int]
-    build_task_ids: typing.Optional[typing.List[int]] = \
-        Field(default_factory=list)
+    build_task_ids: typing.Optional[typing.List[int]] = []
     plan: typing.Optional[typing.Dict[str, typing.Any]]
-    created_by: User
+    owner: User
     platform: Platform
+    product: ReleaseProduct
+    created_at: typing.Optional[datetime.datetime]
 
     class Config:
         orm_mode = True
@@ -39,6 +52,7 @@ class ReleaseCreate(BaseModel):
     builds: typing.List[int]
     build_tasks: typing.Optional[typing.List[int]]
     platform_id: int
+    product_id: int
 
 
 class ReleaseUpdate(BaseModel):
@@ -48,5 +62,4 @@ class ReleaseUpdate(BaseModel):
 
 
 class ReleaseCommitResult(BaseModel):
-    release: Release
     message: str

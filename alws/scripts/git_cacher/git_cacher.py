@@ -5,11 +5,12 @@ import typing
 
 import aioredis
 import pydantic
+import sentry_sdk
 
 from alws.utils.gitea import GiteaClient
 
 
-__all__ = ['load_redis_cache', 'save_redis_cache']
+__all__ = ['Config', 'load_redis_cache', 'save_redis_cache']
 
 
 class Config(pydantic.BaseSettings):
@@ -20,6 +21,9 @@ class Config(pydantic.BaseSettings):
         'rpms': 'rpms_gitea_cache',
         'modules': 'modules_gitea_cache'
     }
+    cacher_sentry_environment: str = "dev"
+    cacher_sentry_dsn: str = ""
+    cacher_sentry_traces_sample_rate: float = 0.2
 
 
 async def load_redis_cache(redis, cache_key):
@@ -45,7 +49,7 @@ def setup_logger():
     return logger
 
 
-async def run(config, redis_client, gitea_client, organization):
+async def run(config, logger, redis_client, gitea_client, organization):
     cache = await load_redis_cache(
         redis_client, config.git_cache_keys[organization]
     )
@@ -53,6 +57,9 @@ async def run(config, redis_client, gitea_client, organization):
     to_index = []
     git_names = set()
     for repo in await gitea_client.list_repos(organization):
+        if repo['empty'] is True:
+            logger.warning(f"Skipping empty repo {repo['html_url']}")
+            continue
         repo_name = repo['full_name']
         git_names.add(repo_name)
         repo_meta = {
@@ -87,14 +94,20 @@ async def run(config, redis_client, gitea_client, organization):
 
 async def main():
     config = Config()
+    if config.cacher_sentry_dsn:
+        sentry_sdk.init(
+            dsn=config.cacher_sentry_dsn,
+            traces_sample_rate=config.cacher_sentry_traces_sample_rate,
+            environment=config.cacher_sentry_environment,
+        )
     logger = setup_logger()
     redis_client = aioredis.from_url(config.redis_url)
     gitea_client = GiteaClient(config.gitea_host, logger)
     while True:
         logger.info('Checking cache for updates')
         await asyncio.gather(
-            run(config, redis_client, gitea_client, 'rpms'),
-            run(config, redis_client, gitea_client, 'modules')
+            run(config, logger, redis_client, gitea_client, 'rpms'),
+            run(config, logger, redis_client, gitea_client, 'modules')
         )
         await asyncio.sleep(600)
 

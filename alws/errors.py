@@ -1,3 +1,6 @@
+from fastapi import status
+
+
 class BuildError(Exception):
     pass
 
@@ -23,6 +26,14 @@ class DistributionError(Exception):
 
 
 class EmptyReleasePlan(ValueError):
+    pass
+
+
+class ProductError(Exception):
+    pass
+
+
+class TeamError(Exception):
     pass
 
 
@@ -67,4 +78,22 @@ class ModuleUpdateError(Exception):
 
 
 class RepositoryAddError(Exception):
+    pass
+
+
+class UploadError(Exception):
+    def __init__(
+        self,
+        detail,
+        status: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
+    ):
+        self.detail = detail
+        self.status = status
+
+
+class PermissionDenied(Exception):
+    pass
+
+
+class UserError(Exception):
     pass

@@ -12,7 +12,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - "./volumes/postgresql/data:/var/lib/postgresql/data"
+      - "../volumes/postgresql/data:/var/lib/postgresql/data"
 
   rabbitmq:
     image: rabbitmq:3.8-management
@@ -73,8 +73,10 @@ services:
       context: .
     volumes:
       - "./alws:/code/alws"
+      - "./tests:/code/tests"
+      - "./almalinux:/code/almalinux"
       - "./scripts:/code/scripts"
-      - "./volumes/pulp/exports:/srv/exports"
+      - "../volumes/pulp/exports:/srv/exports"
       - "./reference_data:/code/reference_data"
     command:
         bash -c 'source env/bin/activate &&
@@ -99,12 +101,83 @@ services:
       - "./reference_data:/code/reference_data"
     command: bash -c 'source env/bin/activate &&
                       /wait_for_it.sh rabbitmq:5672 &&
-                      dramatiq --threads 1 alws.dramatiq.build'
+                      dramatiq alws.dramatiq --threads 1 -Q default'
     restart: on-failure
     depends_on:
       - db
       - pulp
-      - web_server
+      - rabbitmq
+
+  task_queue_builds:
+    image: albs-task-queue:latest
+    env_file:
+      - vars.env
+    build:
+      dockerfile: Dockerfile.task-queue
+      context: .
+    volumes:
+      - "./alws:/code/alws"
+    command: bash -c 'source env/bin/activate &&
+                      /wait_for_it.sh rabbitmq:5672 &&
+                      dramatiq alws.dramatiq --threads 1 -Q builds'
+    restart: on-failure
+    depends_on:
+      - db
+      - pulp
+      - rabbitmq
+
+  task_queue_errata:
+    image: albs-task-queue:latest
+    env_file:
+      - vars.env
+    build:
+      dockerfile: Dockerfile.task-queue
+      context: .
+    volumes:
+      - "./alws:/code/alws"
+    command: bash -c 'source env/bin/activate &&
+                      /wait_for_it.sh rabbitmq:5672 &&
+                      dramatiq alws.dramatiq --processes 1 --threads 1 -Q errata'
+    restart: on-failure
+    depends_on:
+      - db
+      - pulp
+      - rabbitmq
+
+  task_queue_releases:
+    image: albs-task-queue:latest
+    env_file:
+      - vars.env
+    build:
+      dockerfile: Dockerfile.task-queue
+      context: .
+    volumes:
+      - "./alws:/code/alws"
+    command: bash -c 'source env/bin/activate &&
+                      /wait_for_it.sh rabbitmq:5672 &&
+                      dramatiq alws.dramatiq --processes 1 --threads 1 -Q releases'
+    restart: on-failure
+    depends_on:
+      - db
+      - pulp
+      - rabbitmq
+
+  task_queue_tests:
+    image: albs-task-queue:latest
+    env_file:
+      - vars.env
+    build:
+      dockerfile: Dockerfile.task-queue
+      context: .
+    volumes:
+      - "./alws:/code/alws"
+    command: bash -c 'source env/bin/activate &&
+                      /wait_for_it.sh rabbitmq:5672 &&
+                      dramatiq alws.dramatiq --processes 1 --threads 1 -Q tests'
+    restart: on-failure
+    depends_on:
+      - db
+      - pulp
       - rabbitmq
 
   frontend:
@@ -118,6 +191,7 @@ services:
     command: bash -c "npm install && npm run dev"
     volumes:
       - "../albs-frontend:/code"
+      - "../node_modules:/code/node_modules"
     restart: on-failure
     depends_on:
       - web_server
@@ -180,14 +254,18 @@ services:
     ports:
       - 8081:80
     volumes:
-      - "./volumes/pulp/settings:/etc/pulp"
-      - "./volumes/pulp/exports:/srv/exports"
-      - "./volumes/pulp/pulp_storage:/var/lib/pulp"
-      - "./volumes/pulp/pgsql:/var/lib/pgsql"
-      - "./volumes/pulp/containers:/var/lib/containers"
+      - "../volumes/pulp/settings:/etc/pulp"
+      - "../volumes/pulp/exports:/srv/exports"
+      - "../volumes/pulp/pulp_storage:/var/lib/pulp"
+      - "../volumes/pulp/pgsql:/var/lib/pgsql"
+      - "../volumes/pulp/containers:/var/lib/containers"
     devices:
       - "/dev/fuse"
     restart: on-failure
+    #  echo "listen_addresses = '*'" >> /var/lib/pgsql/data/postgresql.conf &&
+    #  echo "host all all 0.0.0.0/0 md5" >> /var/lib/pgsql/data/pg_hba.conf &&
+    #  echo "host all all ::/0 md5" >> /var/lib/pgsql/data/pg_hba.conf &&
+    #  runuser postgres -c 'echo "ALTER USER postgres WITH PASSWORD '"'"'password'"'"';" | /usr/bin/psql'
 
   mosquitto:
     image: eclipse-mosquitto:2.0

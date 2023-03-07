@@ -3,18 +3,57 @@ import re
 import typing
 from collections import namedtuple
 
+from dataclasses import dataclass
 
-__all__ = ['BuildTaskStatus', 'ReleaseStatus', 'TestTaskStatus',
-           'BuildTaskRefType', 'SignStatus', 'RepoType', 'ExportStatus',
-           'debuginfo_regex', 'REQUEST_TIMEOUT', 'DRAMATIQ_TASK_TIMEOUT']
+
+__all__ = [
+    "DEFAULT_PRODUCT",
+    "DEFAULT_TEAM",
+    "DRAMATIQ_TASK_TIMEOUT",
+    "DEFAULT_FILE_CHUNK_SIZE",
+    "REQUEST_TIMEOUT",
+    "SYSTEM_USER_NAME",
+    "UPLOAD_FILE_CHUNK_SIZE",
+    "BuildTaskStatus",
+    "BuildTaskRefType",
+    "ExportStatus",
+    "ErrataPackageStatus",
+    "ErrataReferenceType",
+    "ErrataReleaseStatus",
+    "PackageNevra",
+    "Permissions",
+    "PermissionTriad",
+    "ReleaseStatus",
+    "RepoType",
+    "SignStatus",
+    "TestTaskStatus",
+    "debuginfo_regex",
+]
 
 
 REQUEST_TIMEOUT = 60  # 1 minute
 DRAMATIQ_TASK_TIMEOUT = 36000000  # 10 hours in milliseconds
+DEFAULT_FILE_CHUNK_SIZE = 1048576  # 1 MB
+UPLOAD_FILE_CHUNK_SIZE = 52428800  # 50 MB
+SYSTEM_USER_NAME = "base_user"
+DEFAULT_PRODUCT = "AlmaLinux"
+DEFAULT_TEAM = "almalinux"
+
+
+class Permissions(enum.IntFlag):
+    DELETE = 1
+    WRITE = 2
+    READ = 4
+
+
+@dataclass
+class PermissionTriad:
+    owner: Permissions
+    group: Permissions
+    other: Permissions
 
 
 class BuildTaskStatus(enum.IntEnum):
-
     IDLE = 0
     STARTED = 1
     COMPLETED = 2
@@ -22,8 +61,17 @@ class BuildTaskStatus(enum.IntEnum):
     EXCLUDED = 4
 
     @classmethod
-    def is_finished(cls, status):
+    def is_finished(cls, status: int):
         return status not in (cls.IDLE, cls.STARTED)
+
+    @classmethod
+    def get_status_by_text(cls, text: str):
+        status = cls.COMPLETED
+        if text == "failed":
+            status = cls.FAILED
+        elif text == "excluded":
+            status = cls.EXCLUDED
+        return status
 
 
 class TestTaskStatus(enum.IntEnum):
@@ -40,11 +88,33 @@ class TestCaseStatus(enum.IntEnum):
     SKIPPED = 4
 
 
+class ErrataPackageStatus(enum.Enum):
+    proposal = "proposal"
+    skipped = "skipped"
+    released = "released"
+    approved = "approved"
+
+
+class ErrataReferenceType(enum.Enum):
+    cve = "cve"
+    rhsa = "rhsa"
+    self_ref = "self"
+    bugzilla = "bugzilla"
+
+
+class ErrataReleaseStatus(enum.Enum):
+    NOT_RELEASED = "not released"
+    IN_PROGRESS = "in progress"
+    RELEASED = "released"
+    FAILED = "failed"
+
+
 class ReleaseStatus(enum.IntEnum):
     SCHEDULED = 1
     IN_PROGRESS = 2
     COMPLETED = 3
     FAILED = 4
+    REVERTED = 5
 
 
 class SignStatus(enum.IntEnum):
@@ -84,18 +154,19 @@ class SignStatusEnum(enum.IntEnum):
 
 
 build_ref_str_mapping: typing.Dict[str, int] = {
-    'git_branch': BuildTaskRefType.GIT_BRANCH,
-    'git_tag': BuildTaskRefType.GIT_TAG,
-    'srpm_url': BuildTaskRefType.SRPM_URL,
-    'git_ref': BuildTaskRefType.GIT_REF
+    "git_branch": BuildTaskRefType.GIT_BRANCH,
+    "git_tag": BuildTaskRefType.GIT_TAG,
+    "srpm_url": BuildTaskRefType.SRPM_URL,
+    "git_ref": BuildTaskRefType.GIT_REF,
 }
 
 build_ref_int_mapping: typing.Dict[int, str] = {
     value: key for key, value in build_ref_str_mapping.items()
 }
 
-debuginfo_regex = re.compile(r'debug(info|source)')
+debuginfo_regex = re.compile(r"debug(info|source)")
 
-RepoType = namedtuple('RepoType', ('name', 'arch', 'debug'))
-PackageNevra = namedtuple('PackageNevra',
-                          ('name', 'epoch', 'version', 'release', 'arch'))
+RepoType = namedtuple("RepoType", ("name", "arch", "debug"))
+PackageNevra = namedtuple(
+    "PackageNevra", ("name", "epoch", "version", "release", "arch")
+)

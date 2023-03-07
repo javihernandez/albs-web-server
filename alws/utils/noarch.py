@@ -1,9 +1,12 @@
+import asyncio
 import copy
+import logging
 import typing
 
 import sqlalchemy
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import selectinload
 
 from alws import models
 from alws.constants import BuildTaskStatus
@@ -17,7 +20,7 @@ __all__ = [
 
 
 async def get_noarch_packages(
-    db: Session,
+    db: AsyncSession,
     build_task_ids: typing.List[int]
 ) -> typing.Tuple[dict, dict]:
     query = select(models.BuildTaskArtifact).where(sqlalchemy.and_(
@@ -31,14 +34,19 @@ async def get_noarch_packages(
     debug_noarch_packages = {}
     for artifact in db_artifacts:
         if '-debuginfo-' in artifact.name or '-debugsource-' in artifact.name:
-            debug_noarch_packages[artifact.name] = artifact.href
+            debug_noarch_packages[artifact.name] = (artifact.href,
+                                                    artifact.cas_hash)
             continue
-        noarch_packages[artifact.name] = artifact.href
+        noarch_packages[artifact.name] = (artifact.href, artifact.cas_hash)
 
     return noarch_packages, debug_noarch_packages
 
 
-async def save_noarch_packages(db: Session, pulp_client: PulpClient, build_task: models.BuildTask):
+async def save_noarch_packages(
+    db: AsyncSession,
+    pulp_client: PulpClient,
+    build_task: models.BuildTask,
+):
     new_binary_rpms = []
     query = select(models.BuildTask).where(sqlalchemy.and_(
         models.BuildTask.build_id == build_task.build_id,
@@ -54,16 +62,18 @@ async def save_noarch_packages(db: Session, pulp_client: PulpClient, build_task:
             for task in build_tasks):
         return new_binary_rpms
 
+    logging.info("Start processing noarch packages")
     build_task_ids = [task.id for task in build_tasks]
     noarch_packages, debug_noarch_packages = await get_noarch_packages(
         db, build_task_ids)
     if not any((noarch_packages, debug_noarch_packages)):
+        logging.info("Noarch packages doesn't found")
         return new_binary_rpms
 
     repos_to_update = {}
     new_noarch_artifacts = []
-    hrefs_to_add = list(noarch_packages.values())
-    debug_hrefs_to_add = list(debug_noarch_packages.values())
+    hrefs_to_add = [href for href, _ in noarch_packages.values()]
+    debug_hrefs_to_add = [href for href, _ in debug_noarch_packages.values()]
 
     for task in build_tasks:
         if task.status in (BuildTaskStatus.FAILED,
@@ -79,18 +89,24 @@ async def save_noarch_packages(db: Session, pulp_client: PulpClient, build_task:
         for artifact in task.artifacts:
             if artifact.name in noarch:
                 hrefs_to_delete.append(artifact.href)
-                artifact.href = noarch.pop(artifact.name)
+                href, cas_hash = noarch.pop(artifact.name)
+                artifact.href = href
+                artifact.cas_hash = cas_hash
             if artifact.name in debug_noarch:
                 debug_hrefs_to_delete.append(artifact.href)
-                artifact.href = debug_noarch.pop(artifact.name)
+                href, cas_hash = debug_noarch.pop(artifact.name)
+                artifact.href = href
+                artifact.cas_hash = cas_hash
 
         artifacts_to_create = {**noarch, **debug_noarch}
-        for name, href in artifacts_to_create.items():
+        for name, values in artifacts_to_create.items():
+            href, cas_hash = values
             artifact = models.BuildTaskArtifact(
                 build_task_id=task.id,
                 name=name,
                 type='rpm',
                 href=href,
+                cas_hash=cas_hash,
             )
             new_noarch_artifacts.append(artifact)
             if task.id != build_task.id:
@@ -117,10 +133,12 @@ async def save_noarch_packages(db: Session, pulp_client: PulpClient, build_task:
     db.add_all(new_noarch_artifacts)
     await db.flush()
 
-    for repo_href, content_dict in repos_to_update.items():
-        await pulp_client.modify_repository(
-            repo_to=repo_href,
-            add=content_dict['add'],
-            remove=content_dict['remove'],
-        )
+    await asyncio.gather(*(
+        pulp_client.modify_repository(
+            repo_href, add=content_dict['add'],
+            remove=content_dict['remove'])
+        for repo_href, content_dict in repos_to_update.items()
+    ))
+
+    logging.info("Noarch packages processing is finished")
     return new_binary_rpms

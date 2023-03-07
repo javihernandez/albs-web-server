@@ -1,12 +1,15 @@
-import logging
+import datetime
 from typing import Dict, Any
 
 import dramatiq
+from sqlalchemy import update
 from sqlalchemy.future import select
+from sqlalchemy.orm import Session
+from sqlalchemy.sql.expression import func
 
 from alws import models
-from alws.constants import DRAMATIQ_TASK_TIMEOUT
-from alws.crud import build_node as build_node_crud, platform_flavors, test
+from alws.constants import DRAMATIQ_TASK_TIMEOUT, BuildTaskStatus
+from alws.crud import build_node as build_node_crud, test
 from alws.errors import (
     ArtifactConversionError,
     ModuleUpdateError,
@@ -32,6 +35,27 @@ def _sync_fetch_build(db: SyncSession, build_id: int) -> models.Build:
 
 
 async def _start_build(build_id: int, build_request: build_schema.BuildCreate):
+    has_modules = any((isinstance(t, build_schema.BuildTaskModuleRef)
+                       for t in build_request.tasks))
+    module_build_index = {}
+
+    if has_modules:
+        with SyncSession() as db, db.begin():
+            platforms = db.execute(select(models.Platform).where(
+                models.Platform.name.in_(
+                    [p.name for p in build_request.platforms]))
+            ).scalars().all()
+            for platform in platforms:
+                db.execute(update(models.Platform).where(
+                    models.Platform.id == platform.id).values(
+                    {'module_build_index': models.Platform.module_build_index + 1}))
+                db.add(platform)
+            db.flush()
+            for platform in platforms:
+                module_build_index[platform.name] = platform.module_build_index
+            db.commit()
+            db.close()
+
     with SyncSession() as db:
         with db.begin():
             build = _sync_fetch_build(db, build_id)
@@ -41,6 +65,7 @@ async def _start_build(build_id: int, build_request: build_schema.BuildCreate):
                 platforms=build_request.platforms,
                 platform_flavors=build_request.platform_flavors,
                 is_secure_boot=build_request.is_secure_boot,
+                module_build_index=module_build_index
             )
             for task in build_request.tasks:
                 await planner.add_task(task)
@@ -51,24 +76,74 @@ async def _start_build(build_id: int, build_request: build_schema.BuildCreate):
             db.flush()
             await planner.init_build_repos()
             db.commit()
+        db.close()
 
 
 async def _build_done(request: build_node_schema.BuildDone):
     async for db in get_db():
         success = await build_node_crud.safe_build_done(db, request)
-        if success and request.status == 'done':
-            await test.create_test_tasks(db, request.task_id)
+        # We don't want to create the test tasks until all build tasks
+        # of the same build_id are completed.
+        # The last completed task will trigger the creation of the test tasks
+        # of the same build.
+        all_build_tasks_completed = await _all_build_tasks_completed(db, request.task_id)
+
+        if success and request.status == 'done' and all_build_tasks_completed:
+            build_id = await _get_build_id(db, request.task_id)
+            await test.create_test_tasks_for_build_id(db, build_id)
+        if all_build_tasks_completed:
+            build_id = await _get_build_id(db, request.task_id)
+            await db.execute(
+                update(models.Build)
+                .where(models.Build.id == build_id)
+                .values(finished_at=datetime.datetime.utcnow())
+            )
+            await db.commit()
 
 
-async def _create_log_repo(task_id: int):
-    async for db in get_db():
-        task = await build_node_crud.get_build_task(db, task_id)
-        await build_node_crud.create_build_log_repo(db, task)
+async def _get_build_id(db: Session, build_task_id: int) -> int:
+    async with db.begin():
+        build_id = (await db.execute(select(models.BuildTask.build_id).where(
+            models.BuildTask.id == build_task_id
+        ))).scalars().first()
+        return build_id
+
+
+async def _check_build_and_completed_tasks(
+            db: Session,
+            build_id: int
+        ) -> bool:
+    async with db.begin():
+        build_tasks = (await db.execute(
+            select(func.count()).select_from(models.BuildTask).where(
+                models.BuildTask.build_id == build_id
+            )
+        )).scalar()
+
+        completed_tasks = (await db.execute(
+            select(func.count()).select_from(models.BuildTask).where(
+                models.BuildTask.build_id == build_id,
+                models.BuildTask.status.in_([
+                    BuildTaskStatus.COMPLETED,
+                    BuildTaskStatus.FAILED,
+                    BuildTaskStatus.EXCLUDED,
+                ])
+            )
+        )).scalar()
+
+        return completed_tasks == build_tasks
+
+
+async def _all_build_tasks_completed(db: Session, build_task_id: int) -> bool:
+    build_id = await _get_build_id(db, build_task_id)
+    all_completed = await _check_build_and_completed_tasks(db, build_id)
+    return all_completed
 
 
 @dramatiq.actor(
     max_retries=0,
     priority=0,
+    queue_name='builds',
     time_limit=DRAMATIQ_TASK_TIMEOUT,
 )
 def start_build(build_id: int, build_request: Dict[str, Any]):
@@ -87,12 +162,3 @@ def start_build(build_id: int, build_request: Dict[str, Any]):
 def build_done(request: Dict[str, Any]):
     parsed_build = build_node_schema.BuildDone(**request)
     event_loop.run_until_complete(_build_done(parsed_build))
-
-
-@dramatiq.actor(
-    max_retries=0,
-    priority=0,
-    time_limit=DRAMATIQ_TASK_TIMEOUT,
-)
-def create_log_repo(task_id: int):
-    event_loop.run_until_complete(_create_log_repo(task_id))

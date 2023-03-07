@@ -3,15 +3,16 @@ import typing
 from fastapi import APIRouter, Depends
 
 from alws import database, dramatiq
+from alws.auth import get_current_user
 from alws.crud import test
-from alws.dependencies import get_db, JWTBearer
+from alws.dependencies import get_db
 from alws.schemas import test_schema
 
 
 router = APIRouter(
     prefix='/tests',
     tags=['tests'],
-    dependencies=[Depends(JWTBearer())]
+    dependencies=[Depends(get_current_user)]
 )
 
 public_router = APIRouter(
@@ -37,7 +38,7 @@ async def restart_build_tests(build_id: int,
 @router.put('/build_task/{build_task_id}/restart')
 async def restart_build_task_tests(build_task_id: int,
                                    db: database.Session = Depends(get_db)):
-    await test.create_test_tasks(db, build_task_id)
+    await test.restart_build_task_tests(db, build_task_id)
     return {'ok': True}
 
 

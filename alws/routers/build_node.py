@@ -1,22 +1,21 @@
 import datetime
 import itertools
-
+import typing
 from fastapi import APIRouter, Depends, Response, status
-from dramatiq import pipeline
 
-from alws import database
-from alws import dramatiq
+from alws import database, dramatiq
+from alws.auth import get_current_user
 from alws.config import settings
 from alws.crud import build_node
-from alws.dependencies import get_db, JWTBearer
+from alws.dependencies import get_db
 from alws.schemas import build_node_schema
-from alws.constants import BuildTaskStatus
+from alws.constants import BuildTaskStatus, BuildTaskRefType
 
 
 router = APIRouter(
     prefix='/build_node',
     tags=['builds'],
-    dependencies=[Depends(JWTBearer())]
+    dependencies=[Depends(get_current_user)]
 )
 
 
@@ -44,21 +43,14 @@ async def build_done(
     # We're setting build task timestamp to 3 hours upwards, so
     # dramatiq can have a time to complete task and build node
     # won't rebuild task again and again while it's in the queue
-    # in the future this probably should be handled somehow better 
-    build_task.ts = datetime.datetime.now() + datetime.timedelta(hours=3)
+    # in the future this probably should be handled somehow better
+    build_task.ts = datetime.datetime.utcnow() + datetime.timedelta(hours=3)
     await db.commit()
-    if not await build_node.log_repo_exists(db, build_task):
-        pipe = pipeline([
-            dramatiq.create_log_repo.message(build_task.id),
-            dramatiq.build_done.message_with_options(args=(build_done_.dict(), ), pipe_ignore=True)
-        ])
-        pipe.run()
-    else:
-        dramatiq.build_done.send(build_done_.dict())
+    dramatiq.build_done.send(build_done_.dict())
     return {'ok': True}
 
 
-@router.get('/get_task', response_model=build_node_schema.Task)
+@router.get('/get_task', response_model=typing.Optional[build_node_schema.Task])
 async def get_task(
             request: build_node_schema.RequestTask,
             db: database.Session = Depends(get_db)
@@ -68,20 +60,29 @@ async def get_task(
         return
     # generate full url to builted SRPM for using less memory in database
     built_srpm_url = task.built_srpm_url
+    srpm_hash = None
     if built_srpm_url is not None:
         built_srpm_url = "{}/pulp/content/builds/{}".format(
             settings.pulp_host, task.built_srpm_url)
+        srpm_hash = next((
+            artifact.cas_hash
+            for artifact in task.artifacts
+            if artifact.name.endswith('.src.rpm')
+        ), None)
     response = {
         'id': task.id,
         'arch': task.arch,
+        'build_id': task.build_id,
         'ref': task.ref,
         'platform': build_node_schema.TaskPlatform.from_orm(task.platform),
         'repositories': [],
         'built_srpm_url': built_srpm_url,
         'is_secure_boot': task.is_secure_boot,
+        'alma_commit_cas_hash': task.alma_commit_cas_hash,
+        'srpm_hash': srpm_hash,
         'created_by': {
-            'name': task.build.user.username,
-            'email': task.build.user.email
+            'name': task.build.owner.username,
+            'email': task.build.owner.email
         }
     }
     for repo in itertools.chain(task.platform.repos, task.build.repos):
@@ -93,9 +94,32 @@ async def get_task(
                 response['repositories'].append(repo)
     if task.build.platform_flavors:
         for flavour in task.build.platform_flavors:
+            if flavour.data:
+                for key in ("macros", "secure_boot_macros"):
+                    if "mock" not in flavour.data or key not in flavour.data["mock"]:
+                        continue
+                    if key not in response["platform"].data["mock"]:
+                        response["platform"].data["mock"][key] = {}
+                    response["platform"].data["mock"][key].update(
+                        flavour.data["mock"][key]
+                    )
+                if "definitions" in flavour.data:
+                    response["platform"].data["definitions"].update(
+                        flavour.data["definitions"]
+                    )
             for repo in flavour.repos:
                 if repo.arch == task.arch:
                     response['repositories'].append(repo)
+
+    # TODO: Get rid of this fixes when all affected builds would be processed
+    # mock_enabled flag can be None for old build/flavour/platform repos
+    for repo in response['repositories']:
+        if repo.mock_enabled is None:
+            repo.mock_enabled = True
+    # ref_type can be None for old modular builds
+    if task.ref.ref_type is None:
+        task.ref.ref_type = BuildTaskRefType.GIT_BRANCH
+
     if task.build.mock_options:
         response['platform'].add_mock_options(task.build.mock_options)
     if task.mock_options:

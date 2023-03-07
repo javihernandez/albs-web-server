@@ -1,18 +1,19 @@
 import asyncio
-import typing
-import logging
 import datetime
+import logging
+import re
+import typing
 import urllib.parse
 
 import aiohttp.client_exceptions
-from pydantic import BaseModel, validator, Field, conlist
+from pydantic import BaseModel, AnyHttpUrl, validator, conlist
 
 from alws.config import settings
 from alws.constants import BuildTaskRefType
 from alws import models
 from alws.utils.beholder_client import BeholderClient
 from alws.utils.gitea import (
-    download_modules_yaml, GiteaClient, ModulesYamlNotFoundError
+    download_modules_yaml, GiteaClient
 )
 from alws.utils.modularity import (
     ModuleWrapper,
@@ -20,7 +21,7 @@ from alws.utils.modularity import (
     RpmArtifact,
 )
 from alws.utils.parsing import (
-    clean_module_tag,
+    clean_release,
     get_clean_distr_name,
 )
 
@@ -30,9 +31,11 @@ __all__ = ['BuildTaskRef', 'BuildCreate', 'Build', 'BuildsResponse']
 
 class BuildTaskRef(BaseModel):
 
-    url: str
+    url: AnyHttpUrl
     git_ref: typing.Optional[str]
     ref_type: typing.Optional[int]
+    git_commit_hash: typing.Optional[str]
+    mock_options: typing.Optional[typing.Dict[str, typing.Any]] = None
     is_module: typing.Optional[bool] = False
     enabled: bool = True
     added_artifacts: typing.Optional[list] = []
@@ -78,14 +81,21 @@ class BuildTaskModuleRef(BaseModel):
     module_platform_version: str
     module_version: typing.Optional[str] = None
     modules_yaml: str
+    enabled_modules: dict
     refs: typing.List[BuildTaskRef]
 
 
 class BuildCreatePlatforms(BaseModel):
 
     name: str
-    arch_list: typing.List[typing.Literal['x86_64', 'i686', 'aarch64', 'ppc64le',
-                                          's390x']]
+    arch_list: typing.List[typing.Literal[
+        'x86_64',
+        'i686',
+        'aarch64',
+        'ppc64le',
+        's390x',
+    ]]
+    parallel_mode_enabled: bool
 
 
 class BuildCreate(BaseModel):
@@ -96,6 +106,7 @@ class BuildCreate(BaseModel):
     mock_options: typing.Optional[typing.Dict[str, typing.Any]]
     platform_flavors: typing.Optional[typing.List[int]] = None
     is_secure_boot: bool = False
+    product_id: int
 
 
 class BuildPlatform(BaseModel):
@@ -115,6 +126,7 @@ class BuildTaskArtifact(BaseModel):
     name: str
     type: str
     href: str
+    cas_hash: typing.Optional[str]
 
     class Config:
         orm_mode = True
@@ -122,7 +134,9 @@ class BuildTaskArtifact(BaseModel):
 
 class BuildTaskTestTask(BaseModel):
 
+    id: int
     status: int
+    revision: int
 
     class Config:
         orm_mode = True
@@ -130,7 +144,11 @@ class BuildTaskTestTask(BaseModel):
 
 class BuildSignTask(BaseModel):
 
+    id: int
+    started_at: typing.Optional[datetime.datetime]
+    finished_at: typing.Optional[datetime.datetime]
     status: int
+    stats: typing.Optional[dict]
 
     class Config:
         orm_mode = True
@@ -149,10 +167,21 @@ class RpmModule(BaseModel):
         orm_mode = True
 
 
+class PerformanceStats(BaseModel):
+    id: int
+    build_task_id: typing.Optional[int]
+    statistics: typing.Optional[dict]
+
+    class Config:
+        orm_mode = True
+
+
 class BuildTask(BaseModel):
 
     id: int
     ts: typing.Optional[datetime.datetime]
+    started_at: typing.Optional[datetime.datetime]
+    finished_at: typing.Optional[datetime.datetime]
     status: int
     index: int
     arch: str
@@ -160,41 +189,19 @@ class BuildTask(BaseModel):
     ref: BuildTaskRef
     rpm_module: typing.Optional[RpmModule]
     artifacts: typing.List[BuildTaskArtifact]
+    is_cas_authenticated: typing.Optional[bool]
+    alma_commit_cas_hash: typing.Optional[str]
+    mock_options: typing.Optional[typing.Dict[str, typing.Any]] = None
     is_secure_boot: typing.Optional[bool]
     test_tasks: typing.List[BuildTaskTestTask]
     error: typing.Optional[str]
+    performance_stats: typing.Optional[typing.List[PerformanceStats]] = None
 
     class Config:
         orm_mode = True
 
 
-class BuildSearch(BaseModel):
-
-    created_by: typing.Optional[int]
-    project: typing.Optional[str]
-    ref: typing.Optional[str]
-    rpm_name: typing.Optional[str]
-    rpm_epoch: typing.Optional[str]
-    rpm_version: typing.Optional[str]
-    rpm_release: typing.Optional[str]
-    rpm_arch: typing.Optional[str]
-    platform_id: typing.Optional[int]
-    build_task_arch: typing.Optional[str]
-    released: typing.Optional[bool]
-    signed: typing.Optional[bool]
-
-    @property
-    def is_package_filter(self):
-        return any((
-            self.rpm_name is not None,
-            self.rpm_epoch is not None,
-            self.rpm_version is not None,
-            self.rpm_release is not None,
-            self.rpm_arch is not None,
-        ))
-
-
-class BuildUser(BaseModel):
+class BuildOwner(BaseModel):
 
     id: int
     username: str
@@ -223,16 +230,29 @@ class PlatformFlavour(BaseModel):
         orm_mode = True
 
 
+class Product(BaseModel):
+
+    id: int
+    name: str
+
+    class Config:
+        orm_mode = True
+
+
 class Build(BaseModel):
 
     id: int
     created_at: datetime.datetime
+    finished_at: typing.Optional[datetime.datetime]
     tasks: typing.List[BuildTask]
-    user: BuildUser
+    owner: BuildOwner
     sign_tasks: typing.List[BuildSignTask]
-    linked_builds: typing.Optional[typing.List[int]] = Field(default_factory=list)
+    linked_builds: typing.Optional[typing.List[int]] = []
     mock_options: typing.Optional[typing.Dict[str, typing.Any]]
     platform_flavors: typing.List[PlatformFlavour]
+    release_id: typing.Optional[int]
+    released: bool
+    products: typing.Optional[typing.List[Product]] = []
 
     @validator('linked_builds', pre=True)
     def linked_builds_validator(cls, v):
@@ -265,6 +285,7 @@ class ModuleRef(BaseModel):
     enabled: bool = True
     added_artifacts: typing.Optional[list] = []
     mock_options: dict
+    ref_type: int
 
 
 class ModulePreview(BaseModel):
@@ -273,6 +294,8 @@ class ModulePreview(BaseModel):
     modules_yaml: str
     module_name: str
     module_stream: str
+    enabled_modules: dict
+    git_ref: typing.Optional[str]
 
 
 async def get_module_data_from_beholder(
@@ -314,7 +337,7 @@ def compare_module_data(
         srpm = beholder_artifact['sourcerpm']
         beholder_tag_name = (f"{srpm['name']}-{srpm['version']}-"
                              f"{srpm['release']}")
-        beholder_tag_name = clean_module_tag(beholder_tag_name)
+        beholder_tag_name = clean_release(beholder_tag_name)
         if beholder_tag_name != tag_name:
             continue
         for package in beholder_artifact['packages']:
@@ -361,7 +384,7 @@ async def _get_module_ref(
             # we need only last part from tag to comparison
             # imports/c8-stream-rhel8/golang-1.16.7-1.module+el8.5.0+12+1aae3f
             tag_name = raw_tag_name.split('/')[-1]
-            clean_tag_name = clean_module_tag(tag_name)
+            clean_tag_name = clean_release(tag_name)
             pkgs_to_add = compare_module_data(
                 component_name, beholder_data, clean_tag_name)
             enabled = not pkgs_to_add
@@ -418,26 +441,25 @@ async def get_module_refs(
         task.git_ref,
         BuildTaskRefType.to_text(task.ref_type)
     )
-    devel_ref = task.get_dev_module()
     devel_module = None
-    try:
-        devel_template = await download_modules_yaml(
-            devel_ref.url,
-            devel_ref.git_ref,
-            BuildTaskRefType.to_text(devel_ref.ref_type)
-        )
-        devel_module = ModuleWrapper.from_template(
-            devel_template,
-            name=devel_ref.git_repo_name,
-            stream=devel_ref.module_stream_from_ref()
-        )
-    except ModulesYamlNotFoundError:
-        pass
     module = ModuleWrapper.from_template(
         template,
         name=task.git_repo_name,
         stream=task.module_stream_from_ref()
     )
+    if not module.is_devel:
+        devel_module = ModuleWrapper.from_template(
+            template,
+            name=f'{task.git_repo_name}-devel',
+            stream=task.module_stream_from_ref()
+        )
+
+    has_beta_flafor = False
+    for flavor in flavors:
+        if bool(re.search(r'(-beta)$', flavor.name, re.IGNORECASE)):
+            has_beta_flafor = True
+            break
+
     checking_tasks = []
     if platform_arches is None:
         platform_arches = []
@@ -445,20 +467,27 @@ async def get_module_refs(
         request_arch = arch
         if arch == 'i686':
             request_arch = 'x86_64'
-        endpoint = (
-            f'/api/v1/distros/{clean_dist_name}/{distr_ver}'
-            f'/module/{module.name}/{module.stream}/{request_arch}/'
-        )
-        checking_tasks.append(get_module_data_from_beholder(
-            beholder_client, endpoint, arch))
-        if devel_module is not None:
+        for _module in (module, devel_module):
+            if _module is None:
+                continue
+            # if module is devel and devel_module is None
+            # we shouldn't mark module as devel, because it will broke logic
+            # for partialy updating modules
+            module_is_devel = _module.is_devel and devel_module is not None
             endpoint = (
                 f'/api/v1/distros/{clean_dist_name}/{distr_ver}'
-                f'/module/{devel_module.name}/{devel_module.stream}/'
-                f'{request_arch}/'
+                f'/module/{_module.name}/{_module.stream}/{request_arch}/'
             )
             checking_tasks.append(get_module_data_from_beholder(
-                beholder_client, endpoint, arch, devel=True))
+                beholder_client, endpoint, arch, devel=module_is_devel))
+
+            if has_beta_flafor:
+                endpoint = (
+                    f'/api/v1/distros/{clean_dist_name}-beta/{distr_ver}'
+                    f'/module/{_module.name}/{_module.stream}/{request_arch}/'
+                )
+                checking_tasks.append(get_module_data_from_beholder(
+                    beholder_client, endpoint, arch, devel=module_is_devel))
     beholder_results = await asyncio.gather(*checking_tasks)
 
     platform_prefix_list = platform.modularity['git_tag_prefix']
@@ -479,7 +508,8 @@ async def get_module_refs(
             beholder_data=beholder_results,
         ))
     result = await asyncio.gather(*component_tasks)
+    enabled_modules = module.get_all_build_deps()
     modules = [module.render()]
     if devel_module:
         modules.append(devel_module.render())
-    return result, modules
+    return result, modules, enabled_modules

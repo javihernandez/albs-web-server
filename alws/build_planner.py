@@ -1,8 +1,9 @@
-import logging
 import asyncio
-import typing
 import collections
 import itertools
+import logging
+import typing
+import re
 
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.future import select
@@ -26,7 +27,6 @@ from alws.utils.multilib import MultilibProcessor
 from alws.utils.parsing import get_clean_distr_name, parse_git_ref
 from alws.utils.pulp_client import PulpClient
 
-
 __all__ = ['BuildPlanner']
 
 
@@ -39,6 +39,7 @@ class BuildPlanner:
                 platforms: typing.List[build_schema.BuildCreatePlatforms],
                 platform_flavors: typing.Optional[typing.List[int]],
                 is_secure_boot: bool,
+                module_build_index: typing.Optional[dict],
             ):
         self._db = db
         self._gitea_client = GiteaClient(
@@ -52,16 +53,18 @@ class BuildPlanner:
         )
         self._build = build
         self._task_index = 0
-        self._request_platforms = {
-            platform.name: platform.arch_list for platform in platforms
-        }
+        self._request_platforms = {}
+        self._parallel_modes = {}
         self._platforms = []
         self._platform_flavors = []
         self._modules_by_target = collections.defaultdict(list)
-        self._module_build_index = {}
+        self._module_build_index = module_build_index or {}
         self._module_modified_cache = {}
         self._tasks_cache = collections.defaultdict(list)
         self._is_secure_boot = is_secure_boot
+        for platform in platforms:
+            self._request_platforms[platform.name] = platform.arch_list
+            self._parallel_modes[platform.name] = platform.parallel_mode_enabled
         self.load_platforms()
         if platform_flavors:
             self.load_platform_flavors(platform_flavors)
@@ -82,13 +85,21 @@ class BuildPlanner:
 
     def load_platform_flavors(self, flavors):
         db_flavors = self._db.execute(
-            select(models.PlatformFlavour).where(
-                models.PlatformFlavour.id.in_(flavors)
-        ).options(
-            selectinload(models.PlatformFlavour.repos)
-        )).scalars().all()
+            select(models.PlatformFlavour)
+            .where(models.PlatformFlavour.id.in_(flavors))
+            .options(selectinload(models.PlatformFlavour.repos))
+        ).scalars().all()
         if db_flavors:
             self._platform_flavors = db_flavors
+
+    def is_beta_build(self):
+        if not self._platform_flavors:
+            return False
+        found = False
+        for flavor in self._platform_flavors:
+            if found := bool(re.search(r'(-beta)$', flavor.name, re.IGNORECASE)):
+                break
+        return found
 
     async def create_build_repo(
                 self,
@@ -104,7 +115,7 @@ class BuildPlanner:
         repo_url, pulp_href = await self._pulp_client.create_build_rpm_repo(
             repo_name)
         modules = self._modules_by_target.get((platform.name, arch), [])
-        if modules:
+        if modules and not is_debug:
             await self._pulp_client.modify_repository(
                 pulp_href, add=[module.pulp_href for module in modules]
             )
@@ -118,23 +129,46 @@ class BuildPlanner:
         )
         self._build.repos.append(repo)
 
+    async def create_log_repo(self, repo_type: str,
+                              repo_prefix: str = 'build_logs'):
+        repo_name = f'build-{self._build.id}-{repo_type}'
+        repo_url, repo_href = await self._pulp_client.create_log_repo(
+            repo_name, distro_path_start=repo_prefix)
+        repo = models.Repository(
+            name=repo_name,
+            url=repo_url,
+            arch='log',
+            pulp_href=repo_href,
+            type=repo_type,
+            debug=False
+        )
+        self._build.repos.append(repo)
+
     async def init_build_repos(self):
         tasks = []
         for platform in self._platforms:
-            for arch in ['src'] + self._request_platforms[platform.name]:
+            for arch in self._request_platforms[platform.name]:
                 tasks.append(self.create_build_repo(
                     platform,
                     arch,
                     'rpm'
                 ))
-                if arch == 'src':
-                    continue
                 tasks.append(self.create_build_repo(
                     platform,
                     arch,
                     'rpm',
                     is_debug=True
                 ))
+
+            # Add source RPM repository
+            tasks.append(self.create_build_repo(platform, 'src', 'rpm'))
+
+            # Add build log and test log repositories
+            for repo_type, repo_prefix in (
+                    ('build_log', 'build_logs'), ('test_log', 'test_logs')):
+                tasks.append(self.create_log_repo(
+                    repo_type, repo_prefix=repo_prefix))
+
         await asyncio.gather(*tasks)
 
     async def add_linked_builds(self, linked_build):
@@ -170,6 +204,10 @@ class BuildPlanner:
             self, task: build_schema.BuildTaskModuleRef,
             has_devel: bool = False
     ) -> typing.Dict[str, typing.List[dict]]:
+
+        if not settings.package_beholder_enabled:
+            return {}
+
         beholder_client = BeholderClient(
             settings.beholder_host, token=settings.beholder_token)
         multilib_artifacts = {}
@@ -183,31 +221,130 @@ class BuildPlanner:
 
         return multilib_artifacts
 
+    @staticmethod
+    def merge_beta_module_artifacts(stable: dict, beta: dict) -> dict:
+        # Fast decisions before doing the merge
+        if not stable and not beta:
+            return {}
+        elif stable and not beta:
+            return stable
+        elif not stable and beta:
+            return beta
+
+        merged = {}
+
+        for module_name, projects in stable.items():
+            # If no updates for modules then just copy stable data in result
+            if not beta.get(module_name, {}):
+                merged[module_name] = projects
+                continue
+
+            new_projects = {}
+            beta_projects = beta[module_name]
+            for proj_name, packages in projects.items():
+                # If no updates for packages in beta data
+                # then just copy data in result
+                if not beta_projects.get(proj_name, []):
+                    new_projects[proj_name] = packages
+                    continue
+
+                new_packages = []
+                for stable_pkg in packages:
+                    update_found = False
+                    stable_pkg_name = stable_pkg['name']
+                    stable_pkg_arch = stable_pkg['arch']
+                    for beta_pkg in beta_projects[proj_name]:
+                        if (stable_pkg_name == beta_pkg['name']
+                                and stable_pkg_arch == beta_pkg['arch']):
+                            update_found = True
+                            new_packages.append(beta_pkg)
+                            break
+                    if not update_found:
+                        new_packages.append(stable_pkg)
+
+                new_projects[proj_name] = new_packages
+
+            merged[module_name] = new_projects
+
+        return merged
+
+    async def get_prebuilt_module_artifacts(
+            self,
+            task: build_schema.BuildTaskModuleRef,
+            platform_name: str, platform_version: str, task_arch: str,
+    ) -> dict:
+
+        if not settings.package_beholder_enabled:
+            return {}
+
+        beholder = BeholderClient(
+            settings.beholder_host, token=settings.beholder_token)
+        clean_name = get_clean_distr_name(platform_name)
+        arch = task_arch
+        if task_arch == 'i686':
+            arch = 'x86_64'
+        artifacts = await beholder.get_module_artifacts(
+            clean_name, platform_version, task.module_name,
+            task.module_stream, arch)
+
+        # Include data from beta flavor for partial updates
+        if self.is_beta_build():
+            beta_artifacts = await beholder.get_module_artifacts(
+                f'{clean_name}-beta', platform_version, task.module_name,
+                task.module_stream, arch
+            )
+            if beta_artifacts:
+                artifacts = self.merge_beta_module_artifacts(
+                    artifacts, beta_artifacts)
+
+        reprocessed = {}
+        for module_name, projects in artifacts.items():
+            reprocessed[module_name] = {}
+            for project_name, packages in projects.items():
+                new_packages = []
+                for pkg in packages:
+                    if pkg['arch'] == 'x86_64' and task_arch == 'i686':
+                        pkg['arch'] = 'i686'
+                    new_packages.append(pkg)
+                reprocessed[module_name][project_name] = new_packages
+        return reprocessed
+
     async def prepare_module_index(
-            self, task: build_schema.BuildTaskModuleRef, task_arch: str
+            self, platform: models.Platform,
+            task: build_schema.BuildTaskModuleRef, task_arch: str
     ) -> IndexWrapper:
         allowed_arches = (task_arch, 'src', 'noarch')
         index = IndexWrapper.from_template(task.modules_yaml)
+        # Clean up all artifacts from module for re-population
+        for module in index.iter_modules():
+            for artifact in module.get_rpm_artifacts():
+                module.remove_rpm_artifact(artifact)
+
+        # Refill modules index with data from beholder
+        built_artifacts = await self.get_prebuilt_module_artifacts(
+            task, platform.name, platform.distr_version, task_arch)
 
         for module in index.iter_modules():
             for ref in task.refs:
                 if ref.enabled:
-                    for artifact in ref.added_artifacts:
-                        module.remove_rpm_artifact(artifact)
-                else:
-                    for artifact in ref.added_artifacts:
-                        parsed_artifact = RpmArtifact.from_str(artifact)
-                        if parsed_artifact.arch in allowed_arches:
-                            module.add_rpm_artifact(parsed_artifact.as_dict())
-                        else:
-                            module.remove_rpm_artifact(artifact)
+                    continue
+
+                project_name = ref.url.split('/')[-1].strip()
+                project_name = re.sub(r'\.git$', '', project_name)
+                project_built_artifacts = built_artifacts.get(
+                    module.name, {}).get(project_name, [])
+                if not project_built_artifacts:
+                    continue
+                for artifact in project_built_artifacts:
+                    if artifact['arch'] in allowed_arches:
+                        module.add_rpm_artifact(artifact)
 
         if task_arch == 'x86_64':
             # FIXME: For now we have only 1 platform, so pass multilib findings
             #  accordingly
             multilib_artifacts = await self.get_multilib_artifacts(
                 task, has_devel=index.has_devel_module())
-            multilib_artifacts = multilib_artifacts[self._platforms[0].name]
+            multilib_artifacts = multilib_artifacts.get(platform.name, [])
             await MultilibProcessor.update_module_index(
                 index, task.module_name, task.module_stream,
                 multilib_artifacts
@@ -221,7 +358,7 @@ class BuildPlanner:
                 url=task.url,
                 git_ref=task.git_ref,
                 ref_type=task.ref_type
-            ))
+            ), mock_options=task.mock_options)
             return
 
         if isinstance(task, build_schema.BuildTaskModuleRef):
@@ -280,21 +417,20 @@ class BuildPlanner:
             )
             if task.module_version:
                 module_version = int(task.module_version)
+            mock_enabled_modules = mock_options.get('module_enable', [])[:]
+            # Take the first task mock_options as all tasks share the same mock_options
+            if task.refs:
+                mock_enabled_modules.extend(
+                    task.refs[0].mock_options.get("module_enable", [])
+                )
             for arch in self._request_platforms[platform.name]:
-                module_index = await self.prepare_module_index(task, arch)
+                module_index = await self.prepare_module_index(
+                    platform, task, arch)
                 module = module_index.get_module(
                     task.module_name, task.module_stream)
                 module.add_module_dependencies_from_mock_defs(
-                    mock_modules=mock_options.get('module_enable', []))
-                # TODO: Rework to be able to set enabled modules from UI,
-                #  including ability to disable default modules from template
-                mock_options['module_enable'] = [
-                    f'{module.name}:{module.stream}'
-                ]
-                mock_options['module_enable'] += [
-                    f'{dep_name}:{dep_stream}'
-                    for dep_name, dep_stream in module.iter_dependencies()
-                ]
+                    enabled_modules=task.enabled_modules)
+                mock_options['module_enable'] = mock_enabled_modules
                 module.version = module_version
                 module.context = module.generate_new_context()
                 module.arch = arch
@@ -302,7 +438,7 @@ class BuildPlanner:
                     self._request_platforms[platform.name]
                 )
                 module_index.add_module(module)
-                if module_index.has_devel_module():
+                if module_index.has_devel_module() and not module.is_devel:
                     devel_module = module_index.get_module(
                         f'{task.module_name}-devel', task.module_stream)
                     devel_module.version = module.version
@@ -311,9 +447,8 @@ class BuildPlanner:
                     devel_module.set_arch_list(
                         self._request_platforms[platform.name]
                     )
-                    mock_options['module_enable'].append(
-                        f'{devel_module.name}:{devel_module.stream}'
-                    )
+                    devel_module.add_module_dependency_to_devel_module(
+                        module=module)
                 module_pulp_href, sha256 = await self._pulp_client.create_module(
                     module_index.render(),
                     module.name,
@@ -359,11 +494,15 @@ class BuildPlanner:
         parsed_dist_macro = None
         if ref.git_ref is not None:
             parsed_dist_macro = parse_git_ref(r'(el[\d]+_[\d]+)', ref.git_ref)
-        if mock_options is None:
+        if not mock_options:
             mock_options = {'definitions': {}}
+        if 'definitions' not in mock_options:
+            mock_options['definitions'] = {}
         dist_taken_by_user = mock_options['definitions'].get('dist', False)
         for platform in self._platforms:
             arch_tasks = []
+            first_ref_dep = None
+            is_parallel = self._parallel_modes[platform.name]
             arch_list = self._request_platforms[platform.name]
             if 'i686' in arch_list and arch_list.index('i686') != 0:
                 arch_list.remove('i686')
@@ -375,10 +514,9 @@ class BuildPlanner:
                 if modules:
                     module = modules[0]
                     build_index = self._module_build_index.get(platform.name)
-                    if build_index is None:
-                        platform.module_build_index += 1
-                        build_index = platform.module_build_index
-                        self._module_build_index[platform.name] = build_index
+                    if not build_index:
+                        raise ValueError(
+                            f'Build index for {platform.name} is not defined')
                     platform_dist = modularity_version['dist_prefix']
                     dist_macro = calc_dist_macro(
                         module.name,
@@ -404,11 +542,18 @@ class BuildPlanner:
                 )
                 task_key = (platform.name, arch)
                 self._tasks_cache[task_key].append(build_task)
-                if self._task_index > 0:
-                    dep = self._tasks_cache[task_key][self._task_index - 1]
+                if first_ref_dep and is_parallel:
+                    build_task.dependencies.append(first_ref_dep)
+                idx = self._task_index - 1
+                while idx >= 0:
+                    dep = self._tasks_cache[task_key][idx]
                     build_task.dependencies.append(dep)
-                for dep in arch_tasks:
-                    build_task.dependencies.append(dep)
+                    idx -= 1
+                if not is_parallel:
+                    for dep in arch_tasks:
+                        build_task.dependencies.append(dep)
+                if first_ref_dep is None:
+                    first_ref_dep = build_task
                 arch_tasks.append(build_task)
                 self._build.tasks.append(build_task)
         self._task_index += 1
