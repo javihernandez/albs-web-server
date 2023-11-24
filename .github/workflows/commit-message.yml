@@ -12,6 +12,10 @@ jobs:
     name: Check Commit Message
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_commit.message }}
       - name: Check Line Length
         uses: gsactions/commit-message-checker@v2
         with:
@@ -20,7 +24,7 @@ jobs:
           error: 'The maximum line length of 72 characters is exceeded.'
           excludeDescription: 'true'
           excludeTitle: 'true'
-          accessToken: ${{ secrets.GITHUB_TOKEN }}
+            #accessToken: ${{ secrets.GITHUB_TOKEN }}
       - name: Check for Resolves / Fixes
         uses: gsactions/commit-message-checker@v2
         with:
@@ -28,4 +32,4 @@ jobs:
           error: 'You need at least one "Resolves|Fixes: <issue link>" line.'
           excludeTitle: 'true'
           excludeDescription: 'true'
-          accessToken: ${{ secrets.GITHUB_TOKEN }}
+            #accessToken: ${{ secrets.GITHUB_TOKEN }}
