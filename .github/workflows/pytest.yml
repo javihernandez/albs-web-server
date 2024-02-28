@@ -15,14 +15,16 @@ jobs:
         name: Check out repository
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      - name: Create dirs
+      - name: Create dirs and files
         run: |
           mkdir -p /home/runner/work/albs-web-server/alts
           mkdir -p /home/runner/work/albs-web-server/albs-frontend
           mkdir -p /home/runner/work/albs-web-server/albs-node
+          mkdir -p /home/runner/work/albs-web-server/albs-sign-file
           mkdir -p /home/runner/work/albs-web-server/albs-sign-node
           mkdir -p /home/runner/work/albs-web-server/alma-tests-cacher
           touch /home/runner/work/albs-web-server/alma-tests-cacher/vars.env
+          touch /home/runner/work/albs-web-server/albs-sign-file/.env
       - name: Add env file
         run: |
           touch ./vars.env
@@ -50,7 +52,7 @@ jobs:
             db
             web_server
       - name: Run unit tests (pytest)
-        run: docker-compose run -v /tmp:/tmp --no-deps web_server bash -o pipefail -c 'source
+        run: docker-compose run -e GITHUB_ACTIONS=true -v /tmp:/tmp --no-deps web_server bash -o pipefail -c 'source
           env/bin/activate && pip3 install -r requirements.txt &&
           pytest -vv --ignore alws/ --cov-report term-missing:skip-covered
           --cov-report xml:/tmp/coverage.xml --junitxml=/tmp/pytest.xml --cov=alws
