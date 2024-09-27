@@ -69,6 +69,7 @@ jobs:
         uses: MishaKav/pytest-coverage-comment@main
         id: coverageComment
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           pytest-coverage-path: /tmp/pytest-coverage.txt
           pytest-xml-coverage-path: /tmp/coverage.xml
           title: Coverage report for changed files
